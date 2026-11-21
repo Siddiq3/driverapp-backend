@@ -91,6 +91,7 @@ async function handleRequest(db: Db, b: Body) {
     p_hours: num(b.hours),
     p_note: str(b.note),
     p_driver: isUuid(b.driver_id) ? b.driver_id : null, // a driver the customer picked from the list
+    p_offer: num(b.offer) != null ? Math.round(num(b.offer)!) : null, // customer's price offer
   });
   if (error) throw new Error(error.message);
 
@@ -206,7 +207,7 @@ async function loadTrip(tripId: string): Promise<TripWithPeople | null> {
 async function notifyNewOffers(tripId: string, since: string) {
   const { data: trip } = await adminClient
     .from("trips")
-    .select("service_type, trip_type, vehicle_type, pickup_address, requested_driver_id")
+    .select("service_type, trip_type, vehicle_type, pickup_address, requested_driver_id, customer_offer")
     .eq("id", tripId)
     .maybeSingle();
   if (!trip) return;
@@ -223,7 +224,7 @@ async function notifyNewOffers(tripId: string, since: string) {
   const messages: PushMessage[] = (offers ?? []).map((o: any) => ({
     to: o.driver?.profile?.push_token ?? "",
     title: trip.requested_driver_id ? "A customer chose you!" : "New trip request",
-    body: `${kind} · ${o.distance_km ?? "?"} km away · ${trip.pickup_address}`,
+    body: `${trip.customer_offer ? `Offers ₹${trip.customer_offer} · ` : ""}${kind} · ${o.distance_km ?? "?"} km away · ${trip.pickup_address}`,
     data: { trip_id: tripId, type: "offer" },
     channelId: "trip-requests",
   }));
