@@ -9,7 +9,7 @@
 //   request  -> request_trip  -> push to drivers who got the offer
 //   widen    -> widen_search  -> push to new drivers in the wider area
 //   accept   -> accept_trip   -> push to the customer
-//   update   -> driver_update_trip (arrived / started / completed) -> push to customer
+//   update   -> driver_update_trip (arrived / started with PIN / completed) -> push to customer
 //   cancel   -> cancel_trip   -> push to the other person
 
 import { corsHeaders, errorResponse, json } from "../_shared/http.ts";
@@ -136,6 +136,7 @@ async function handleUpdate(db: Db, b: Body) {
   const { data, error } = await db.rpc("driver_update_trip", {
     p_trip: b.trip_id,
     p_status: b.status,
+    p_pin: b.status === "started" ? str(b.pin, 4) : null,
   });
   if (error) throw new Error(error.message);
 
