@@ -15,18 +15,9 @@
 import { corsHeaders, errorResponse, json } from "../_shared/http.ts";
 import { adminClient, userClient } from "../_shared/supabase.ts";
 import { sendPush, type PushMessage } from "../_shared/push.ts";
+import { msg } from "../_shared/messages.ts";
 
 type Body = Record<string, unknown> & { action?: string };
-
-const SERVICE_LABEL: Record<string, string> = {
-  car_with_driver: "Car + driver",
-  driver_only: "Driver only",
-};
-const TRIP_LABEL: Record<string, string> = {
-  local: "Local",
-  outstation: "Outstation",
-  hourly: "Hourly",
-};
 
 const isUuid = (v: unknown): v is string =>
   typeof v === "string" && /^[0-9a-f-]{36}$/i.test(v);
@@ -119,10 +110,11 @@ async function handleAccept(db: Db, b: Body) {
   if (won) {
     const trip = await loadTrip(b.trip_id);
     if (trip?.customer?.push_token) {
+      const m = msg(trip.customer.language);
       await sendPush([{
         to: trip.customer.push_token,
-        title: "Driver found",
-        body: `${trip.driver?.full_name ?? "Your driver"} accepted your trip.`,
+        title: m.acceptedTitle,
+        body: m.acceptedBody(trip.driver?.full_name ?? m.yourDriver),
         data: { trip_id: b.trip_id, type: "accepted" },
       }]);
     }
@@ -145,10 +137,11 @@ async function handleUpdate(db: Db, b: Body) {
   const trip = await loadTrip(b.trip_id);
   const token = trip?.customer?.push_token;
   if (token && b.status !== "started") {
-    const msg: PushMessage = b.status === "arrived"
-      ? { to: token, title: "Your driver has arrived", body: "Please meet your driver at the pickup point." }
-      : { to: token, title: "Trip completed", body: "Please rate your driver. Thank you for riding!" };
-    await sendPush([{ ...msg, data: { trip_id: b.trip_id, type: b.status } }]);
+    const m = msg(trip?.customer?.language);
+    const push: PushMessage = b.status === "arrived"
+      ? { to: token, title: m.arrivedTitle, body: m.arrivedBody }
+      : { to: token, title: m.completedTitle, body: m.completedBody };
+    await sendPush([{ ...push, data: { trip_id: b.trip_id, type: b.status } }]);
   }
   return json(data);
 }
@@ -166,10 +159,11 @@ async function handleCancel(db: Db, b: Body) {
     const byCustomer = trip.cancelled_by === trip.customer_id;
     const other = byCustomer ? trip.driver : trip.customer;
     if (other?.push_token) {
+      const m = msg(other.language);
       await sendPush([{
         to: other.push_token,
-        title: "Trip cancelled",
-        body: byCustomer ? "The customer cancelled this trip." : "Your driver cancelled. Please book again.",
+        title: m.cancelledTitle,
+        body: byCustomer ? m.cancelledByCustomer : m.cancelledByDriver,
         data: { trip_id: b.trip_id, type: "cancelled" },
       }]);
     }
@@ -184,8 +178,8 @@ type TripWithPeople = {
   customer_id: string;
   driver_id: string | null;
   cancelled_by: string | null;
-  customer: { full_name: string | null; push_token: string | null } | null;
-  driver: { full_name: string | null; push_token: string | null } | null;
+  customer: { full_name: string | null; push_token: string | null; language: string | null } | null;
+  driver: { full_name: string | null; push_token: string | null; language: string | null } | null;
 };
 
 async function loadTrip(tripId: string): Promise<TripWithPeople | null> {
@@ -193,8 +187,8 @@ async function loadTrip(tripId: string): Promise<TripWithPeople | null> {
     .from("trips")
     .select(
       "id, customer_id, driver_id, cancelled_by, " +
-        "customer:profiles!trips_customer_id_fkey(full_name, push_token), " +
-        "driver:drivers!trips_driver_id_fkey(profile:profiles!drivers_id_fkey(full_name, push_token))",
+        "customer:profiles!trips_customer_id_fkey(full_name, push_token, language), " +
+        "driver:drivers!trips_driver_id_fkey(profile:profiles!drivers_id_fkey(full_name, push_token, language))",
     )
     .eq("id", tripId)
     .maybeSingle();
@@ -214,20 +208,29 @@ async function notifyNewOffers(tripId: string, since: string) {
 
   const { data: offers } = await adminClient
     .from("trip_offers")
-    .select("distance_km, driver:drivers!trip_offers_driver_id_fkey(profile:profiles!drivers_id_fkey(push_token))")
+    .select("distance_km, driver:drivers!trip_offers_driver_id_fkey(profile:profiles!drivers_id_fkey(push_token, language))")
     .eq("trip_id", tripId)
     .eq("response", "pending")
     .gte("sent_at", since);
 
-  const kind = [SERVICE_LABEL[trip.service_type], TRIP_LABEL[trip.trip_type]].join(" · ");
   // deno-lint-ignore no-explicit-any
-  const messages: PushMessage[] = (offers ?? []).map((o: any) => ({
-    to: o.driver?.profile?.push_token ?? "",
-    title: trip.requested_driver_id ? "A customer chose you!" : "New trip request",
-    body: `${trip.customer_offer ? `Offers ₹${trip.customer_offer} · ` : ""}${kind} · ${o.distance_km ?? "?"} km away · ${trip.pickup_address}`,
-    data: { trip_id: tripId, type: "offer" },
-    channelId: "trip-requests",
-  }));
+  const messages: PushMessage[] = (offers ?? []).map((o: any) => {
+    const m = msg(o.driver?.profile?.language);
+    const parts = [
+      trip.customer_offer ? m.offers(trip.customer_offer) : null,
+      m.service[trip.service_type as keyof typeof m.service],
+      m.tripType[trip.trip_type as keyof typeof m.tripType],
+      m.kmAway(String(o.distance_km ?? "?")),
+      trip.pickup_address,
+    ].filter(Boolean);
+    return {
+      to: o.driver?.profile?.push_token ?? "",
+      title: trip.requested_driver_id ? m.offerTitleChosen : m.offerTitle,
+      body: parts.join(" · "),
+      data: { trip_id: tripId, type: "offer" },
+      channelId: "trip-requests",
+    };
+  });
 
   await sendPush(messages);
 }

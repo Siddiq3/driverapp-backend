@@ -15,6 +15,7 @@ App ◄── Realtime                   trip status (customer), new offers (dri
 - **Free near me**: `free_drivers_near()` lists free, approved drivers nearest first (no phone numbers). Customers can request one chosen driver, or everyone nearby.
 - **Price is agreed on the phone** in v1. Drivers can set an optional `rate_note`. The fare table stays for later.
 - **Ride PIN**: the driver enters the customer's 4-digit PIN to start.
+- **Languages**: `profiles.language` (en / te / hi). Push notifications are sent in each person's language (`functions/_shared/messages.ts`).
 - **First accept wins** inside the database: one `UPDATE … WHERE status = 'searching'`, so two drivers can never both get a trip.
 - **Search grows** (requests to everyone): 5 km → 10 km → 20 km, 2 minutes each, then the trip expires. A request to one chosen driver expires after 2 minutes.
 - **Auto-busy**: a driver who ignores 3 requests in a row is switched to Busy.
