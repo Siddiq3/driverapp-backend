@@ -1,0 +1,32 @@
+# Supabase CLI config. Run `supabase link --project-ref <your-ref>` once.
+project_id = "driverapp"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public"]
+max_rows = 1000
+
+[db]
+port = 54322
+major_version = 15
+
+[realtime]
+enabled = true
+
+[auth]
+enabled = true
+site_url = "driverapp://"
+additional_redirect_urls = ["driverapp://**"]
+jwt_expiry = 3600
+enable_signup = true
+
+[auth.external.google]
+enabled = true
+client_id = "env(GOOGLE_WEB_CLIENT_ID)"
+secret = "env(GOOGLE_CLIENT_SECRET)"
+# Needed for native Google sign-in (signInWithIdToken) on Android
+skip_nonce_check = true
+
+[functions.trip]
+verify_jwt = true
