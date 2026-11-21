@@ -21,6 +21,10 @@ App ◄── Realtime                   trip status (customer), new offers (dri
 - **Auto-busy**: a driver who ignores 3 requests in a row is switched to Busy.
 - **Security**: Row Level Security on every table. Users can't write to tables directly; every change goes through a checked function.
 
+## API docs
+
+[`docs/openapi.yaml`](docs/openapi.yaml) — OpenAPI 3 (Swagger) spec with schemas and examples for every endpoint the app uses. Open it in [Swagger Editor](https://editor.swagger.io) (File → Import file) to browse and try requests.
+
 ## Folder layout
 
 ```
@@ -35,6 +39,8 @@ supabase/
     trip/                      the one Edge Function (actions + push notifications)
     _shared/                   push, http, supabase helpers
   config.toml
+docs/
+  openapi.yaml               Swagger / OpenAPI spec
 ```
 
 ## Setup (one time)

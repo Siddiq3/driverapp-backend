@@ -1,0 +1,854 @@
+openapi: 3.0.3
+info:
+  title: DriverApp API
+  version: 1.0.0
+  description: |
+    Backend API for the DriverApp mobile app (book a car with driver, or a driver for your own car).
+
+    The backend is **Supabase**, so there are three kinds of endpoints:
+
+    | Kind | Path | Used for |
+    | --- | --- | --- |
+    | Edge Function | `POST /functions/v1/trip` | Actions that also send push notifications: request, widen, accept, update, cancel |
+    | RPC (database functions) | `POST /rest/v1/rpc/{name}` | Everything else that changes data: driver signup, free/busy, prices, rating, SOS, lists |
+    | REST tables (read) | `GET /rest/v1/{table}` | Reading profiles, drivers, trips, offers. Row Level Security decides which rows each user sees |
+
+    **Every request needs two headers:**
+    - `apikey: <SUPABASE_ANON_KEY>`
+    - `Authorization: Bearer <user access token>` (from Google sign-in, see `/auth/v1/token`)
+
+    Errors from database rules come back as HTTP 400 with a plain message, e.g. `"Finish your current trip first"`.
+    The app translates these messages into Telugu / Hindi.
+  contact:
+    name: DriverApp
+servers:
+  - url: https://{project}.supabase.co
+    variables:
+      project:
+        default: your-project-ref
+        description: Your Supabase project reference
+
+security:
+  - apiKey: []
+    bearerAuth: []
+
+tags:
+  - name: Auth
+  - name: Trip actions
+    description: Edge Function `trip` — runs the action as the signed-in user, then sends push notifications.
+  - name: Customer
+  - name: Driver
+  - name: Trips (read)
+  - name: Profile
+  - name: Admin
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Auth
+  # ---------------------------------------------------------------------------
+  /auth/v1/token:
+    post:
+      tags: [Auth]
+      summary: Sign in with Google (ID token from the phone)
+      description: The app gets a Google ID token with native Google Sign-In and exchanges it for a Supabase session. A profile row is created automatically on first sign-in.
+      security:
+        - apiKey: []
+      parameters:
+        - name: grant_type
+          in: query
+          required: true
+          schema: { type: string, enum: [id_token] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider, id_token]
+              properties:
+                provider: { type: string, enum: [google] }
+                id_token: { type: string }
+            example:
+              provider: google
+              id_token: eyJhbGciOiJSUzI1NiIsImtpZCI6...
+      responses:
+        "200":
+          description: Session
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token: { type: string }
+                  refresh_token: { type: string }
+                  expires_in: { type: integer, example: 3600 }
+                  user:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      email: { type: string, format: email }
+        "400": { $ref: "#/components/responses/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Edge Function: trip actions
+  # ---------------------------------------------------------------------------
+  /functions/v1/trip:
+    post:
+      tags: [Trip actions]
+      summary: Request, widen, accept, update or cancel a trip
+      description: |
+        One endpoint, chosen by `action`:
+
+        | action | Who | What happens | Push sent to |
+        | --- | --- | --- | --- |
+        | `request` | Customer | Creates a trip. With `driver_id` → only that driver gets it. Without → all free drivers within 5 km | Offered drivers |
+        | `widen` | Customer | After 2 min with no accept: 5 → 10 → 20 km, then `expired`. Direct requests expire straight away | Newly offered drivers |
+        | `accept` | Driver | First driver to accept wins (atomic). Returns `accepted: false` if someone else was first | Customer |
+        | `update` | Driver | `arrived` → `started` (needs the customer's 4-digit PIN) → `completed` | Customer (arrived, completed) |
+        | `cancel` | Customer or driver | Cancels the trip | The other person |
+
+        Push texts are sent in each receiver's language (en / te / hi).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/RequestTripAction"
+                - $ref: "#/components/schemas/WidenAction"
+                - $ref: "#/components/schemas/AcceptAction"
+                - $ref: "#/components/schemas/UpdateAction"
+                - $ref: "#/components/schemas/CancelAction"
+              discriminator:
+                propertyName: action
+                mapping:
+                  request: "#/components/schemas/RequestTripAction"
+                  widen: "#/components/schemas/WidenAction"
+                  accept: "#/components/schemas/AcceptAction"
+                  update: "#/components/schemas/UpdateAction"
+                  cancel: "#/components/schemas/CancelAction"
+            examples:
+              requestChosenDriver:
+                summary: Request one driver picked from the "free near you" list, with a price offer
+                value:
+                  action: request
+                  service: car_with_driver
+                  trip_type: local
+                  vehicle: null
+                  pickup_address: Main Road, Tenali
+                  pickup_lat: 16.2379
+                  pickup_lng: 80.6444
+                  note: "Going to: Guntur · now"
+                  driver_id: 7b0c1d0e-5d0a-4a1e-9a43-1f0b8f3a2c11
+                  offer: 600
+              requestEveryone:
+                summary: Ask everyone nearby (car with driver, to a drop point)
+                value:
+                  action: request
+                  service: car_with_driver
+                  trip_type: local
+                  vehicle: sedan
+                  pickup_address: Main Road, Tenali
+                  pickup_lat: 16.2379
+                  pickup_lng: 80.6444
+                  drop_address: Bus stand, Guntur
+                  drop_lat: 16.3067
+                  drop_lng: 80.4365
+                  note: 2 bags
+              requestDriverOnlyByHours:
+                summary: Driver for my own car, 6 hours, no drop
+                value:
+                  action: request
+                  service: driver_only
+                  trip_type: hourly
+                  pickup_address: Gandhi Nagar, Tenali
+                  pickup_lat: 16.2401
+                  pickup_lng: 80.6402
+                  hours: 6
+              widen:
+                value: { action: widen, trip_id: 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90 }
+              accept:
+                value: { action: accept, trip_id: 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90 }
+              arrived:
+                value: { action: update, trip_id: 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90, status: arrived }
+              startWithPin:
+                value: { action: update, trip_id: 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90, status: started, pin: "4821" }
+              complete:
+                value: { action: update, trip_id: 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90, status: completed }
+              cancel:
+                value: { action: cancel, trip_id: 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90, reason: Plan changed }
+      responses:
+        "200":
+          description: Result depends on the action
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RequestTripResult"
+                  - $ref: "#/components/schemas/WidenResult"
+                  - $ref: "#/components/schemas/AcceptResult"
+                  - $ref: "#/components/schemas/Trip"
+              examples:
+                request:
+                  value: { trip_id: 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90, drivers_notified: 4 }
+                widen:
+                  value: { status: searching, search_radius_km: 10, drivers_notified: 3 }
+                widenExpired:
+                  value: { status: expired, search_radius_km: 20, drivers_notified: 0 }
+                acceptWon:
+                  value: { accepted: true }
+                acceptLost:
+                  value: { accepted: false }
+        "400":
+          description: A rule stopped the action
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                busyCustomer: { value: { error: You already have a trip in progress } }
+                driverTaken: { value: { error: This driver is not free any more. Please choose another one. } }
+                wrongPin: { value: { error: Wrong PIN. Ask the customer for the 4-digit PIN shown in their app. } }
+                badOffer: { value: { error: Please enter a price between ₹50 and ₹2,00,000 } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ---------------------------------------------------------------------------
+  # Customer RPCs
+  # ---------------------------------------------------------------------------
+  /rest/v1/rpc/free_drivers_near:
+    post:
+      tags: [Customer]
+      summary: Free drivers / cars near a point (the home list)
+      description: Approved, free drivers with fresh GPS and no active trip, nearest first, max 50. **No phone numbers** — those are shared after the driver accepts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_lat, p_lng]
+              properties:
+                p_lat: { type: number, format: double }
+                p_lng: { type: number, format: double }
+                p_radius_km: { type: integer, default: 10, minimum: 1, maximum: 20 }
+                p_kind:
+                  type: string
+                  nullable: true
+                  enum: [car, driver]
+                  description: "`car` = drivers with a car, `driver` = everyone who drives, null = all"
+            example: { p_lat: 16.2379, p_lng: 80.6444, p_radius_km: 10, p_kind: car }
+      responses:
+        "200":
+          description: Nearest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/FreeDriver" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /rest/v1/rpc/nearby_drivers:
+    post:
+      tags: [Customer]
+      summary: Approximate positions of free drivers (map markers)
+      description: Positions rounded to ~100 m. No names or ids.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_lat, p_lng]
+              properties:
+                p_lat: { type: number, format: double }
+                p_lng: { type: number, format: double }
+                p_radius_km: { type: integer, default: 5, maximum: 20 }
+            example: { p_lat: 16.2379, p_lng: 80.6444, p_radius_km: 10 }
+      responses:
+        "200":
+          description: Up to 30 markers
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/NearbyDriver" }
+              example:
+                - { lat: 16.239, lng: 80.645, has_car: true, vehicle_type: sedan }
+                - { lat: 16.241, lng: 80.641, has_car: false, vehicle_type: null }
+
+  /rest/v1/rpc/estimate_fare:
+    post:
+      tags: [Customer]
+      summary: Fare estimate from the admin fare table (kept for later; v1 shows driver prices instead)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_service, p_trip_type]
+              properties:
+                p_service: { $ref: "#/components/schemas/ServiceType" }
+                p_trip_type: { $ref: "#/components/schemas/TripType" }
+                p_vehicle: { $ref: "#/components/schemas/VehicleTypeNullable" }
+                p_distance_km: { type: number, nullable: true }
+                p_hours: { type: integer, nullable: true }
+            example: { p_service: car_with_driver, p_trip_type: local, p_vehicle: sedan, p_distance_km: 12.4, p_hours: null }
+      responses:
+        "200":
+          description: Rupees, rounded to 10
+          content:
+            application/json:
+              schema: { type: integer, example: 260 }
+
+  /rest/v1/rpc/get_trip_pin:
+    post:
+      tags: [Customer]
+      summary: The customer's 4-digit ride PIN
+      description: Only the trip's customer gets it, and only while status is `accepted` or `arrived`. Drivers can never read it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TripIdParam" }
+            example: { p_trip: 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90 }
+      responses:
+        "200":
+          description: PIN or null
+          content:
+            application/json:
+              schema: { type: string, nullable: true, pattern: "^[0-9]{4}$", example: "4821" }
+
+  /rest/v1/rpc/rate_trip:
+    post:
+      tags: [Customer, Driver]
+      summary: Rate the other person after a completed trip
+      description: Customer rates driver (updates the driver's average) or driver rates customer. Once per person per trip.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_trip, p_stars]
+              properties:
+                p_trip: { type: string, format: uuid }
+                p_stars: { type: integer, minimum: 1, maximum: 5 }
+                p_comment: { type: string, nullable: true, maxLength: 500 }
+            example: { p_trip: 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90, p_stars: 5, p_comment: On time, safe driving }
+      responses:
+        "200": { description: Saved (empty body) }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /rest/v1/rpc/trigger_sos:
+    post:
+      tags: [Customer, Driver]
+      summary: Emergency alert to the admin team
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_trip]
+              properties:
+                p_trip: { type: string, format: uuid, nullable: true }
+                p_lat: { type: number, nullable: true }
+                p_lng: { type: number, nullable: true }
+            example: { p_trip: 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90, p_lat: 16.25, p_lng: 80.62 }
+      responses:
+        "200":
+          description: SOS event id
+          content:
+            application/json:
+              schema: { type: integer, example: 17 }
+
+  # ---------------------------------------------------------------------------
+  # Driver RPCs
+  # ---------------------------------------------------------------------------
+  /rest/v1/rpc/register_driver:
+    post:
+      tags: [Driver]
+      summary: Sign up (or edit) as a driver
+      description: Creates or updates the driver row with status `pending`. A `rejected` driver who edits goes back to `pending`. Also sets the profile role to `driver`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_has_car, p_licence_number]
+              properties:
+                p_has_car: { type: boolean }
+                p_vehicle_type: { $ref: "#/components/schemas/VehicleTypeNullable" }
+                p_vehicle_model: { type: string, nullable: true }
+                p_vehicle_number: { type: string, nullable: true, description: Required when p_has_car is true }
+                p_licence_number: { type: string }
+            examples:
+              withCar:
+                value: { p_has_car: true, p_vehicle_type: sedan, p_vehicle_model: Maruti Dzire, p_vehicle_number: AP 39 AB 1234, p_licence_number: AP0920190012345 }
+              driverOnly:
+                value: { p_has_car: false, p_vehicle_type: null, p_vehicle_model: null, p_vehicle_number: null, p_licence_number: AP0920190012345 }
+      responses:
+        "200":
+          description: The driver row
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Driver" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /rest/v1/rpc/set_driver_rates:
+    post:
+      tags: [Driver]
+      summary: Set the driver's own prices (shown to customers)
+      description: At least one price is required. `p_per_km` is ignored for drivers without a car.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                p_per_km: { type: integer, nullable: true, minimum: 1, maximum: 1000 }
+                p_per_hour: { type: integer, nullable: true, minimum: 1, maximum: 10000 }
+                p_per_day: { type: integer, nullable: true, minimum: 1, maximum: 100000 }
+                p_note: { type: string, nullable: true, maxLength: 80 }
+            example: { p_per_km: 12, p_per_hour: 250, p_per_day: 2000, p_note: Night charges extra }
+      responses:
+        "200": { description: Saved (empty body) }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /rest/v1/rpc/set_driver_availability:
+    post:
+      tags: [Driver]
+      summary: Go free (get trips) or busy
+      description: Going free needs the current position. Not allowed while the driver has an active trip. Going free also resets the missed-request counter.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_available]
+              properties:
+                p_available: { type: boolean }
+                p_lat: { type: number, nullable: true }
+                p_lng: { type: number, nullable: true }
+            examples:
+              goFree: { value: { p_available: true, p_lat: 16.2379, p_lng: 80.6444 } }
+              goBusy: { value: { p_available: false } }
+      responses:
+        "200":
+          description: The driver row
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Driver" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /rest/v1/rpc/update_driver_location:
+    post:
+      tags: [Driver]
+      summary: Send the driver's GPS position (every ~2 minutes while free)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_lat, p_lng]
+              properties:
+                p_lat: { type: number }
+                p_lng: { type: number }
+            example: { p_lat: 16.2391, p_lng: 80.6450 }
+      responses:
+        "200": { description: Saved (empty body) }
+
+  /rest/v1/rpc/skip_trip:
+    post:
+      tags: [Driver]
+      summary: Skip a trip request
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TripIdParam" }
+            example: { p_trip: 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90 }
+      responses:
+        "200": { description: Skipped (empty body) }
+
+  # ---------------------------------------------------------------------------
+  # Reads (REST, filtered by Row Level Security)
+  # ---------------------------------------------------------------------------
+  /rest/v1/profiles:
+    get:
+      tags: [Profile]
+      summary: Read profiles (own, or the other person on a shared trip)
+      parameters:
+        - { name: id, in: query, schema: { type: string, example: "eq.7b0c1d0e-5d0a-4a1e-9a43-1f0b8f3a2c11" } }
+        - { name: select, in: query, schema: { type: string, example: "*" } }
+      responses:
+        "200":
+          description: Profiles
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Profile" }
+    patch:
+      tags: [Profile]
+      summary: Update own profile
+      description: "Only these columns can be changed: full_name, phone, role, push_token, avatar_url, language. `is_admin` can never be changed by users."
+      parameters:
+        - { name: id, in: query, required: true, schema: { type: string, example: "eq.7b0c1d0e-5d0a-4a1e-9a43-1f0b8f3a2c11" } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProfileUpdate" }
+            examples:
+              setup: { value: { full_name: Ravi Kumar, phone: "9876543210", role: customer } }
+              language: { value: { language: te } }
+              pushToken: { value: { push_token: "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]" } }
+      responses:
+        "204": { description: Updated }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /rest/v1/drivers:
+    get:
+      tags: [Driver]
+      summary: Read driver rows (own, or your trip's driver)
+      parameters:
+        - { name: id, in: query, schema: { type: string, example: "eq.7b0c1d0e-5d0a-4a1e-9a43-1f0b8f3a2c11" } }
+        - name: select
+          in: query
+          schema:
+            type: string
+            example: "id,has_car,vehicle_type,vehicle_model,vehicle_number,rating_avg,rating_count,profile:profiles!drivers_id_fkey(full_name,phone,avatar_url)"
+      responses:
+        "200":
+          description: Drivers
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Driver" }
+
+  /rest/v1/trips:
+    get:
+      tags: [Trips (read)]
+      summary: Read trips
+      description: "Customers see their own trips. Drivers see trips assigned to them, plus trips they were offered while still `searching`."
+      parameters:
+        - { name: id, in: query, schema: { type: string, example: "eq.3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90" } }
+        - { name: customer_id, in: query, schema: { type: string, example: "eq.7b0c1d0e-5d0a-4a1e-9a43-1f0b8f3a2c11" } }
+        - { name: driver_id, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, example: "in.(searching,accepted,arrived,started)" } }
+        - { name: order, in: query, schema: { type: string, example: created_at.desc } }
+        - { name: limit, in: query, schema: { type: integer, example: 50 } }
+      responses:
+        "200":
+          description: Trips
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Trip" }
+
+  /rest/v1/trip_offers:
+    get:
+      tags: [Driver]
+      summary: The driver's pending requests, with trip details
+      parameters:
+        - { name: driver_id, in: query, schema: { type: string, example: "eq.7b0c1d0e-5d0a-4a1e-9a43-1f0b8f3a2c11" } }
+        - { name: response, in: query, schema: { type: string, example: eq.pending } }
+        - { name: select, in: query, schema: { type: string, example: "distance_km,trip:trips(*)" } }
+      responses:
+        "200":
+          description: Offers
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    distance_km: { type: number, example: 1.4 }
+                    trip: { $ref: "#/components/schemas/Trip" }
+
+  # ---------------------------------------------------------------------------
+  # Admin
+  # ---------------------------------------------------------------------------
+  /rest/v1/rpc/admin_set_driver_status:
+    post:
+      tags: [Admin]
+      summary: Approve, reject or block a driver (admins only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_driver, p_status]
+              properties:
+                p_driver: { type: string, format: uuid }
+                p_status: { $ref: "#/components/schemas/DriverStatus" }
+            example: { p_driver: 7b0c1d0e-5d0a-4a1e-9a43-1f0b8f3a2c11, p_status: approved }
+      responses:
+        "200": { description: Done (empty body) }
+        "400":
+          description: Not an admin
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PostgrestError" }
+              example: { code: P0001, message: Admins only, details: null, hint: null }
+
+# =============================================================================
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: apikey
+      description: Supabase anon (publishable) key — safe to ship in the app
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: The signed-in user's access token
+
+  responses:
+    Error:
+      description: A rule stopped the request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/PostgrestError" }
+          example: { code: P0001, message: Finish your current trip first, details: null, hint: null }
+    Unauthorized:
+      description: Missing or expired token
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: Not signed in }
+
+  schemas:
+    # ---- Enums ----
+    UserRole: { type: string, enum: [customer, driver] }
+    DriverStatus: { type: string, enum: [pending, approved, rejected, blocked] }
+    VehicleType: { type: string, enum: [hatchback, sedan, suv] }
+    VehicleTypeNullable: { type: string, enum: [hatchback, sedan, suv], nullable: true }
+    ServiceType:
+      type: string
+      enum: [car_with_driver, driver_only]
+      description: "`car_with_driver` = we send a car with a driver; `driver_only` = a driver for the customer's own car"
+    TripType:
+      type: string
+      enum: [local, outstation, hourly]
+      description: "In town / outstation (over 40 km) / by hours (no drop)"
+    TripStatus:
+      type: string
+      enum: [searching, accepted, arrived, started, completed, cancelled, expired]
+    Language: { type: string, enum: [en, te, hi] }
+
+    # ---- Rows ----
+    Profile:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        full_name: { type: string, nullable: true, example: Ravi Kumar }
+        phone: { type: string, nullable: true, pattern: "^\\+?[0-9]{10,13}$", example: "9876543210" }
+        role: { $ref: "#/components/schemas/UserRole" }
+        is_admin: { type: boolean, readOnly: true }
+        push_token: { type: string, nullable: true }
+        avatar_url: { type: string, nullable: true }
+        language: { $ref: "#/components/schemas/Language" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ProfileUpdate:
+      type: object
+      properties:
+        full_name: { type: string }
+        phone: { type: string, pattern: "^\\+?[0-9]{10,13}$" }
+        role: { $ref: "#/components/schemas/UserRole" }
+        push_token: { type: string, nullable: true }
+        language: { $ref: "#/components/schemas/Language" }
+
+    Driver:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        has_car: { type: boolean, example: true }
+        vehicle_type: { $ref: "#/components/schemas/VehicleTypeNullable" }
+        vehicle_model: { type: string, nullable: true, example: Maruti Dzire }
+        vehicle_number: { type: string, nullable: true, example: AP39AB1234 }
+        licence_number: { type: string, example: AP0920190012345 }
+        status: { $ref: "#/components/schemas/DriverStatus" }
+        is_available: { type: boolean, description: The Free / Busy switch }
+        rating_avg: { type: number, example: 4.8 }
+        rating_count: { type: integer, example: 37 }
+        missed_streak: { type: integer, description: Requests ignored in a row; 3 → switched to Busy }
+        rate_per_km: { type: integer, nullable: true, example: 12 }
+        rate_per_hour: { type: integer, nullable: true, example: 250 }
+        rate_per_day: { type: integer, nullable: true, example: 2000 }
+        rate_note: { type: string, nullable: true, example: Night charges extra }
+        location_updated_at: { type: string, format: date-time, nullable: true }
+
+    FreeDriver:
+      type: object
+      description: One card in the customer's "free near you" list
+      properties:
+        id: { type: string, format: uuid }
+        full_name: { type: string, nullable: true, example: Suresh }
+        avatar_url: { type: string, nullable: true }
+        has_car: { type: boolean }
+        vehicle_type: { $ref: "#/components/schemas/VehicleTypeNullable" }
+        vehicle_model: { type: string, nullable: true }
+        rating_avg: { type: number }
+        rating_count: { type: integer }
+        rate_note: { type: string, nullable: true }
+        rate_per_km: { type: integer, nullable: true }
+        rate_per_hour: { type: integer, nullable: true }
+        rate_per_day: { type: integer, nullable: true }
+        distance_km: { type: number, example: 1.2 }
+      example:
+        id: 7b0c1d0e-5d0a-4a1e-9a43-1f0b8f3a2c11
+        full_name: Suresh Babu
+        avatar_url: null
+        has_car: true
+        vehicle_type: sedan
+        vehicle_model: Maruti Dzire
+        rating_avg: 4.8
+        rating_count: 37
+        rate_note: Night charges extra
+        rate_per_km: 12
+        rate_per_hour: 250
+        rate_per_day: 2000
+        distance_km: 1.2
+
+    NearbyDriver:
+      type: object
+      properties:
+        lat: { type: number, description: Rounded to 3 decimals (~100 m) }
+        lng: { type: number }
+        has_car: { type: boolean }
+        vehicle_type: { $ref: "#/components/schemas/VehicleTypeNullable" }
+
+    Trip:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        customer_id: { type: string, format: uuid }
+        driver_id: { type: string, format: uuid, nullable: true }
+        requested_driver_id: { type: string, format: uuid, nullable: true, description: Set when the customer picked one driver }
+        service_type: { $ref: "#/components/schemas/ServiceType" }
+        trip_type: { $ref: "#/components/schemas/TripType" }
+        vehicle_type: { $ref: "#/components/schemas/VehicleTypeNullable" }
+        pickup_address: { type: string, example: Main Road, Tenali }
+        pickup_lat: { type: number, example: 16.2379 }
+        pickup_lng: { type: number, example: 80.6444 }
+        drop_address: { type: string, nullable: true, example: Bus stand, Guntur }
+        drop_lat: { type: number, nullable: true }
+        drop_lng: { type: number, nullable: true }
+        distance_km: { type: number, nullable: true, description: Straight line × 1.3 }
+        hours: { type: integer, nullable: true, minimum: 1, maximum: 72 }
+        fare_estimate: { type: integer, description: From the fare table; not shown in v1 }
+        customer_offer: { type: integer, nullable: true, example: 600, description: Price the customer offered (₹) }
+        customer_note: { type: string, nullable: true, maxLength: 300 }
+        status: { $ref: "#/components/schemas/TripStatus" }
+        search_radius_km: { type: integer, example: 5 }
+        expires_at: { type: string, format: date-time, description: When the current 2-minute search round ends }
+        accepted_at: { type: string, format: date-time, nullable: true }
+        arrived_at: { type: string, format: date-time, nullable: true }
+        started_at: { type: string, format: date-time, nullable: true }
+        completed_at: { type: string, format: date-time, nullable: true }
+        cancelled_at: { type: string, format: date-time, nullable: true }
+        cancelled_by: { type: string, format: uuid, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    # ---- Edge Function bodies ----
+    RequestTripAction:
+      type: object
+      required: [action, service, trip_type, pickup_address, pickup_lat, pickup_lng]
+      properties:
+        action: { type: string, enum: [request] }
+        service: { $ref: "#/components/schemas/ServiceType" }
+        trip_type: { $ref: "#/components/schemas/TripType" }
+        vehicle: { $ref: "#/components/schemas/VehicleTypeNullable" }
+        pickup_address: { type: string }
+        pickup_lat: { type: number }
+        pickup_lng: { type: number }
+        drop_address: { type: string, nullable: true, description: "Needed for car_with_driver local/outstation when asking everyone" }
+        drop_lat: { type: number, nullable: true }
+        drop_lng: { type: number, nullable: true }
+        hours: { type: integer, nullable: true, description: "Needed for driver_only and hourly when asking everyone" }
+        note: { type: string, nullable: true, maxLength: 300 }
+        driver_id: { type: string, format: uuid, nullable: true, description: "Send only to this driver; drop and hours become optional" }
+        offer: { type: integer, nullable: true, minimum: 50, maximum: 200000, description: "Customer's price offer (₹)" }
+
+    WidenAction:
+      type: object
+      required: [action, trip_id]
+      properties:
+        action: { type: string, enum: [widen] }
+        trip_id: { type: string, format: uuid }
+
+    AcceptAction:
+      type: object
+      required: [action, trip_id]
+      properties:
+        action: { type: string, enum: [accept] }
+        trip_id: { type: string, format: uuid }
+
+    UpdateAction:
+      type: object
+      required: [action, trip_id, status]
+      properties:
+        action: { type: string, enum: [update] }
+        trip_id: { type: string, format: uuid }
+        status: { type: string, enum: [arrived, started, completed] }
+        pin: { type: string, pattern: "^[0-9]{4}$", description: Required when status is started }
+
+    CancelAction:
+      type: object
+      required: [action, trip_id]
+      properties:
+        action: { type: string, enum: [cancel] }
+        trip_id: { type: string, format: uuid }
+        reason: { type: string, nullable: true }
+
+    RequestTripResult:
+      type: object
+      properties:
+        trip_id: { type: string, format: uuid }
+        drivers_notified: { type: integer }
+
+    WidenResult:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/TripStatus" }
+        search_radius_km: { type: integer }
+        drivers_notified: { type: integer }
+
+    AcceptResult:
+      type: object
+      properties:
+        accepted: { type: boolean, description: false = another driver was first }
+
+    TripIdParam:
+      type: object
+      required: [p_trip]
+      properties:
+        p_trip: { type: string, format: uuid }
+
+    # ---- Errors ----
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+
+    PostgrestError:
+      type: object
+      properties:
+        code: { type: string, example: P0001 }
+        message: { type: string }
+        details: { type: string, nullable: true }
+        hint: { type: string, nullable: true }
