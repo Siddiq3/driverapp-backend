@@ -12,6 +12,7 @@ App ──► Edge Function "trip"       request / widen / accept / update / can
 App ◄── Realtime                   trip status (customer), new offers (driver)
 ```
 
+- **Only commercial cars**: a driver can list their own car only with a yellow (commercial) plate and a taxi/tourist permit number (`register_driver` and a table check enforce it). Drivers without a car drive the customer's own car, which needs no permit.
 - **Free near me**: `free_drivers_near()` lists free, approved drivers nearest first (no phone numbers). Customers can request one chosen driver, or everyone nearby.
 - **Price is agreed on the phone** in v1. Drivers can set an optional `rate_note`. The fare table stays for later.
 - **Ride PIN**: the driver enters the customer's 4-digit PIN to start.
@@ -72,7 +73,7 @@ docs/
 
 | Task | How |
 | --- | --- |
-| Approve a driver | Table editor → `drivers` → set `status` to `approved` (check the licence first). The admin panel will call `admin_set_driver_status()` |
+| Approve a driver | Table editor → `drivers` → set `status` to `approved`. Check the licence first. For a driver with a car (`has_car`), also check the RC shows a **yellow (commercial) plate** and the `permit_number` matches a valid taxi/tourist permit. The admin panel will call `admin_set_driver_status()` |
 | Change fares | Edit the `fare_rates` table — the app picks them up instantly |
 | See SOS alerts | Table `sos_events` where `resolved = false` |
 | Change timings (2 min, 5/10/20 km, 3 missed) | Edit `app_setting()` in a new migration |

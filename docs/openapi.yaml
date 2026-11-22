@@ -369,7 +369,14 @@ paths:
     post:
       tags: [Driver]
       summary: Sign up (or edit) as a driver
-      description: Creates or updates the driver row with status `pending`. A `rejected` driver who edits goes back to `pending`. Also sets the profile role to `driver`.
+      description: |
+        Creates or updates the driver row with status `pending`. A `rejected` driver who edits goes back to `pending`.
+        Also sets the profile role to `driver`.
+
+        **Only commercial cars.** When `p_has_car` is true the car must have a yellow (commercial) number plate
+        (`p_commercial_plate: true`) and a taxi / tourist permit number. A private white-plate car carrying paying
+        passengers breaks the Motor Vehicles Act. An approved driver who adds a car or changes its number or
+        permit goes back to `pending` (and Busy) until an admin checks the RC and permit again.
       requestBody:
         required: true
         content:
@@ -383,11 +390,16 @@ paths:
                 p_vehicle_model: { type: string, nullable: true }
                 p_vehicle_number: { type: string, nullable: true, description: Required when p_has_car is true }
                 p_licence_number: { type: string }
+                p_commercial_plate: { type: boolean, default: false, description: Must be true when p_has_car is true }
+                p_permit_number: { type: string, nullable: true, description: Taxi / tourist permit number. Required when p_has_car is true }
             examples:
               withCar:
-                value: { p_has_car: true, p_vehicle_type: sedan, p_vehicle_model: Maruti Dzire, p_vehicle_number: AP 39 AB 1234, p_licence_number: AP0920190012345 }
+                value: { p_has_car: true, p_vehicle_type: sedan, p_vehicle_model: Maruti Dzire, p_vehicle_number: AP 39 TA 1234, p_licence_number: AP0920190012345, p_commercial_plate: true, p_permit_number: AP/TP/2025/0077 }
               driverOnly:
                 value: { p_has_car: false, p_vehicle_type: null, p_vehicle_model: null, p_vehicle_number: null, p_licence_number: AP0920190012345 }
+              whitePlateRejected:
+                summary: Private car → 400 "Only cars with a yellow (commercial) number plate can be listed"
+                value: { p_has_car: true, p_vehicle_type: sedan, p_vehicle_model: Maruti Dzire, p_vehicle_number: AP 39 AB 1234, p_licence_number: AP0920190012345, p_commercial_plate: false, p_permit_number: null }
       responses:
         "200":
           description: The driver row
@@ -681,6 +693,8 @@ components:
         vehicle_model: { type: string, nullable: true, example: Maruti Dzire }
         vehicle_number: { type: string, nullable: true, example: AP39AB1234 }
         licence_number: { type: string, example: AP0920190012345 }
+        commercial_plate: { type: boolean, example: true, description: Driver confirmed a yellow (commercial) number plate }
+        permit_number: { type: string, nullable: true, example: AP/TP/2025/0077 }
         status: { $ref: "#/components/schemas/DriverStatus" }
         is_available: { type: boolean, description: The Free / Busy switch }
         rating_avg: { type: number, example: 4.8 }
